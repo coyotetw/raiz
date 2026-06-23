@@ -1,0 +1,15 @@
+# Streamlit secrets — nunca subir a GitHub
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Archivos temporales
+*.xlsx
+*.csv
+*.log
