@@ -1,18 +1,19 @@
 """
 data_loader.py — Carga y procesamiento de datos para Raíz Emprendedora
-Fuentes: Google Sheets (base_madre) · Google Drive (base_raiz) · PostgreSQL (BCRA)
+Lee los archivos Excel directamente del repositorio (carpeta data/)
 """
 
 import pandas as pd
 import numpy as np
 import re
-import requests
+import os
 import psycopg2
 import streamlit as st
 
-# ── IDs de fuentes ────────────────────────────────────────────────────────
-ID_BASE_MADRE = "15vKBWHv-xO8_zKrvBsEN2vLso7_5bpbIhLMAwg_TjTc"
-ID_BASE_RAIZ  = "11fKa4zEQ6iY7YrG2Qqh7dZWbWvXc4lFF"
+# ── Rutas locales (archivos dentro del repo) ──────────────────────────────
+BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+PATH_MADRE    = os.path.join(BASE_DIR, "data", "base_madre.xlsx")
+PATH_RAIZ     = os.path.join(BASE_DIR, "data", "base_raiz.xlsx")
 
 # ── Columnas de eventos con etiquetas legibles ────────────────────────────
 EVENTOS = {
@@ -54,31 +55,24 @@ def clasificar_formalidad(row):
 
 def clasificar_regimen(act):
     a = str(act).upper()
-    if "MONOTRIBUTO"          in a: return "Monotributo"
-    if "AUTÓNOMO"  in a or "AUTONOMO" in a: return "Autónomo"
+    if "MONOTRIBUTO"           in a: return "Monotributo"
+    if "AUTÓNOMO" in a or "AUTONOMO" in a: return "Autónomo"
     if "RESPONSABLE INSCRIPTO" in a: return "Resp. Inscripto"
     return "Sin dato"
 
 
-def descargar_excel(url, timeout=30):
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return pd.read_excel(r.content, dtype=str)
-
-
 @st.cache_data(ttl=3600, show_spinner="Cargando datos del programa...")
 def cargar_base():
-    # ── Fuente 1: Base madre (personas) ──────────────────────────────────
-    url_bm = f"https://docs.google.com/spreadsheets/d/{ID_BASE_MADRE}/export?format=xlsx"
-    bm = descargar_excel(url_bm)
+
+    # ── Fuente 1: Base madre ──────────────────────────────────────────────
+    bm = pd.read_excel(PATH_MADRE, dtype=str)
     bm["cuit_limpio"] = bm["CUIT"].apply(limpiar_cuit)
 
-    # ── Fuente 2: Base raiz (actividad + BCRA pipeline) ───────────────────
-    url_br = f"https://drive.google.com/uc?export=download&id={ID_BASE_RAIZ}"
-    br = descargar_excel(url_br)
-    br["cuit_limpio"]   = br["cuit"].apply(limpiar_cuit)
-    br["formalidad"]    = br.apply(clasificar_formalidad, axis=1)
-    br["regimen"]       = br["actividades"].apply(clasificar_regimen)
+    # ── Fuente 2: Base raiz ───────────────────────────────────────────────
+    br = pd.read_excel(PATH_RAIZ, dtype=str)
+    br["cuit_limpio"] = br["cuit"].apply(limpiar_cuit)
+    br["formalidad"]  = br.apply(clasificar_formalidad, axis=1)
+    br["regimen"]     = br["actividades"].apply(clasificar_regimen)
 
     # ── Merge personas + actividad ────────────────────────────────────────
     COLS_BM = [c for c in [
@@ -92,7 +86,7 @@ def cargar_base():
                "nombre_arca", "actividades", "ok_arca", "estado_arca"]
 
     df_pers = bm[COLS_BM].dropna(subset=["cuit_limpio"]).drop_duplicates("cuit_limpio")
-    df_act  = br[COLS_BR].drop_duplicates("cuit_limpio")
+    df_act  = br[[c for c in COLS_BR if c in br.columns]].drop_duplicates("cuit_limpio")
     base    = df_pers.merge(df_act, on="cuit_limpio", how="left")
     base["formalidad"] = base["formalidad"].fillna("Sin dato")
     base["regimen"]    = base["regimen"].fillna("Sin dato")
@@ -117,24 +111,25 @@ def cargar_base():
             conn.close()
             df_bcra = df_bcra.rename(columns={"cuit": "cuit_limpio"})
             MAP_SIT = {
-                0: "Sin deuda", 1: "Normal", 2: "Riesgo bajo",
-                3: "Riesgo medio", 4: "Riesgo alto",
-                5: "Irrecuperable", 6: "Irrecuperable técnico"
+                0: "Sin deuda",    1: "Normal",      2: "Riesgo bajo",
+                3: "Riesgo medio", 4: "Riesgo alto", 5: "Irrecuperable",
+                6: "Irrecuperable técnico"
             }
             df_bcra["situacion_label"] = df_bcra["peor_situacion"].map(MAP_SIT).fillna("Sin dato")
             df_bcra["tiene_deuda"]     = df_bcra["monto_total"] > 0
             base = base.merge(df_bcra, on="cuit_limpio", how="left")
         except Exception as e:
-            st.warning(f"Sin conexión BCRA: {e}")
+            st.warning(f"⚠️ Sin conexión BCRA: {e}")
             _bcra_vacios(base)
     else:
+        st.info("ℹ️ DATABASE_URL no configurada en secrets — datos BCRA no disponibles.")
         _bcra_vacios(base)
 
     # ── Tipado final ──────────────────────────────────────────────────────
-    base["peor_situacion"]     = pd.to_numeric(base.get("peor_situacion"), errors="coerce").fillna(-1).astype(int)
-    base["monto_total"]        = pd.to_numeric(base.get("monto_total"),    errors="coerce").fillna(0)
+    base["peor_situacion"]     = pd.to_numeric(base.get("peor_situacion"),     errors="coerce").fillna(-1).astype(int)
+    base["monto_total"]        = pd.to_numeric(base.get("monto_total"),        errors="coerce").fillna(0)
     base["cantidad_entidades"] = pd.to_numeric(base.get("cantidad_entidades"), errors="coerce").fillna(0).astype(int)
-    base["tiene_deuda"]        = base.get("tiene_deuda", False).fillna(False).astype(str).str.upper() == "TRUE"
+    base["tiene_deuda"]        = base.get("tiene_deuda", pd.Series(False, index=base.index)).fillna(False).astype(str).str.upper() == "TRUE"
     base["situacion_label"]    = base.get("situacion_label", pd.Series("Sin registro BCRA", index=base.index)).fillna("Sin registro BCRA")
     base["Edad_norm"]          = pd.to_numeric(base.get("Edad_norm"), errors="coerce")
     base["Total_participaciones"] = pd.to_numeric(base.get("Total_participaciones"), errors="coerce").fillna(1).astype(int)
